@@ -1,3 +1,4 @@
+// crud.rs
 use crate::db::create_pool;
 use crate::models::PublicUser;
 use crate::{PubAccount, Transaction};
@@ -10,11 +11,22 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use sqlx::query;
 use uuid::Uuid;
-/// Створює нового користувача та хешує пароль
+
+/// Vytvori noveho pouzivatela a zahashuje heslo
+///
+/// # Parametre
+/// - name: pouzivatelske meno (musi byt unikatne)
+/// - password: heslo v plain texte (bude zahashovane pomocou Argon2)
+///
+/// # Navratova hodnota
+/// Vracia PublicUser (bez hesla) alebo chybu ak pouzivatel uz existuje
+///
+/// # Bezpecnost
+/// Heslo je zahashovane pomocou Argon2 s nahodnou solu pred ulozenim do databazy
 pub async fn create_user(name: &str, password: &str) -> Result<PublicUser, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
-    // Хешуємо пароль
+    // Hashovanie hesla pomocou Argon2
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let password_hash = argon2
@@ -22,7 +34,7 @@ pub async fn create_user(name: &str, password: &str) -> Result<PublicUser, sqlx:
         .unwrap()
         .to_string();
 
-    // Генеруємо UUID для користувача
+    // Generovanie UUID pre noveho pouzivatela
     let user_id = Uuid::new_v4();
 
     let row = query!(
@@ -40,6 +52,13 @@ pub async fn create_user(name: &str, password: &str) -> Result<PublicUser, sqlx:
     })
 }
 
+/// Ziska pouzivatela podla jeho ID
+///
+/// # Parametre
+/// - user_id: UUID pouzivatela
+///
+/// # Navratova hodnota
+/// Vracia PublicUser alebo chybu ak pouzivatel neexistuje
 pub async fn get_user(user_id: Uuid) -> Result<PublicUser, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
@@ -53,15 +72,25 @@ pub async fn get_user(user_id: Uuid) -> Result<PublicUser, sqlx::Error> {
     })
 }
 
+/// Zmaze pouzivatela a vsetky jeho ucty
+///
+/// # Parametre
+/// - user_id: UUID pouzivatela na zmazanie
+///
+/// # Navratova hodnota
+/// Vracia pocet zmazanych riadkov (0 ak pouzivatel neexistoval)
+///
+/// # Poznamka
+/// Najprv su zmazane vsetky ucty pouzivatela, potom samotny pouzivatel
 pub async fn delete_user(user_id: Uuid) -> Result<u64, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
-    // Спочатку видаляємо всі рахунки
+    // Najprv zmazeme vsetky ucty pouzivatela
     query!("DELETE FROM accounts WHERE user_id = $1", user_id)
         .execute(&pool)
         .await?;
 
-    // Потім видаляємо користувача
+    // Potom zmazeme samotneho pouzivatela
     let result = query!("DELETE FROM users WHERE id = $1", user_id)
         .execute(&pool)
         .await?;
@@ -69,6 +98,13 @@ pub async fn delete_user(user_id: Uuid) -> Result<u64, sqlx::Error> {
     Ok(result.rows_affected())
 }
 
+/// Vytvori novy bankovy ucet pre pouzivatela
+///
+/// # Parametre
+/// - user_id: UUID pouzivatela, pre ktoreho sa ma ucet vytvorit
+///
+/// # Navratova hodnota
+/// Vracia PubAccount s nulovou pociatocnou bilanciou
 pub async fn create_account(user_id: Uuid) -> Result<PubAccount, sqlx::Error> {
     let pool: PgPool = create_pool().await;
     let account_id = Uuid::new_v4();
@@ -86,6 +122,14 @@ pub async fn create_account(user_id: Uuid) -> Result<PubAccount, sqlx::Error> {
         balance: row.balance,
     })
 }
+
+/// Ziska vsetky ucty pouzivatela
+///
+/// # Parametre
+/// - user_id: UUID pouzivatela
+///
+/// # Navratova hodnota
+/// Vracia zoznam vsetkych uctov pouzivatela (moze byt prazdny)
 pub async fn get_account(user_id: Uuid) -> Result<Vec<PubAccount>, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
@@ -95,7 +139,8 @@ pub async fn get_account(user_id: Uuid) -> Result<Vec<PubAccount>, sqlx::Error> 
     )
     .fetch_all(&pool)
     .await?;
-    // Перетворюємо кожен рядок у PubAccount
+
+    // Konvertovanie riadkov z databazy na PubAccount struktury
     let accounts = rows
         .into_iter()
         .map(|row| PubAccount {
@@ -107,6 +152,15 @@ pub async fn get_account(user_id: Uuid) -> Result<Vec<PubAccount>, sqlx::Error> 
 
     Ok(accounts)
 }
+
+/// Prida peniaze na ucet
+///
+/// # Parametre
+/// - account_id: UUID uctu
+/// - money: suma na pridanie (musi byt kladna)
+///
+/// # Navratova hodnota
+/// Vracia aktualizovany PubAccount s novou bilanciou
 pub async fn add_money(account_id: Uuid, money: Decimal) -> Result<PubAccount, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
@@ -124,6 +178,26 @@ pub async fn add_money(account_id: Uuid, money: Decimal) -> Result<PubAccount, s
         balance: row.balance,
     })
 }
+
+/// Vytvori transakciu - prevod penazi medzi dvoma uctami
+///
+/// # Parametre
+/// - from_account: UUID uctu odosielatela
+/// - to_account: UUID uctu prijemcu
+/// - amount: suma prevodu
+///
+/// # Navratova hodnota
+/// Vracia Transaction objekt alebo chybu
+///
+/// # Bezpecnost a validacia
+/// - Pouziva databazovu transakciu (BEGIN/COMMIT) pre ACID vlastnosti
+/// - Overuje ci ma odosielatel dostatocny zostatok
+/// - Pouziva FOR UPDATE zamok pre zabranenie race conditions
+/// - Ak akakolvek operacia zlyhava, vsetky zmeny su automaticky stornovane (ROLLBACK)
+///
+/// # Chyby
+/// - sqlx::Error::RowNotFound: nedostatocny zostatok na ucte odosielatela
+/// - Ine sqlx::Error: problemy s databazou alebo neexistujuce ucty
 pub async fn make_transaction(
     from_account: Uuid,
     to_account: Uuid,
@@ -131,22 +205,23 @@ pub async fn make_transaction(
 ) -> Result<Transaction, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
-    // КРИТИЧНО: Починаємо SQL транзакцію
+    // Zacatie databazovej transakcie - zabezpecuje atomicitu operacie
     let mut tx = pool.begin().await?;
 
-    // 1. Перевіряємо баланс відправника
+    // Kontrola zostatku odosielatela a zablokovanie riadku (FOR UPDATE)
     let sender = query!(
-        "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE", // FOR UPDATE блокує рядок
+        "SELECT balance FROM accounts WHERE id = $1 FOR UPDATE",
         from_account
     )
     .fetch_one(&mut *tx)
     .await?;
 
+    // Validacia - overenie dostatocneho zostatku
     if sender.balance < amount {
-        return Err(sqlx::Error::RowNotFound); // Недостатньо коштів
+        return Err(sqlx::Error::RowNotFound);
     }
 
-    // 2. Знімаємо гроші з відправника
+    // Odcitanie penazi z uctu odosielatela
     query!(
         "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
         amount,
@@ -155,7 +230,7 @@ pub async fn make_transaction(
     .execute(&mut *tx)
     .await?;
 
-    // 3. Додаємо гроші отримувачу
+    // Pripocitanie penazi na ucet prijemcu
     query!(
         "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
         amount,
@@ -164,7 +239,7 @@ pub async fn make_transaction(
     .execute(&mut *tx)
     .await?;
 
-    // 4. Створюємо запис транзакції
+    // Vytvorenie zaznamu transakcie v tabulke
     let trans_id = Uuid::new_v4();
     let transaction = query!(
         "INSERT INTO transactions (id, from_account, to_account, amount) 
@@ -178,7 +253,8 @@ pub async fn make_transaction(
     .fetch_one(&mut *tx)
     .await?;
 
-    // 5. Підтверджуємо транзакцію (все або нічого!)
+    // Potvrdenie transakcie - vsetky zmeny su trvale ulozene
+    // Ak nedojde k commit(), zmeny sa automaticky stornuju
     tx.commit().await?;
 
     Ok(Transaction {
@@ -190,9 +266,27 @@ pub async fn make_transaction(
     })
 }
 
+/// Prihlasenie pouzivatela pomocou mena a hesla
+///
+/// # Parametre
+/// - username: pouzivatelske meno
+/// - password: heslo v plain texte
+///
+/// # Navratova hodnota
+/// Vracia PublicUser alebo String s chybovou spravou
+///
+/// # Bezpecnost
+/// - Heslo je overovane pomocou Argon2 verify funkcie
+/// - Nehashuje sa znovu, len sa porovna s ulozenim hashom
+///
+/// # Chyby
+/// - "User not found": pouzivatel s danym menom neexistuje
+/// - "Invalid password hash": chyba pri parsovani hashu z databazy
+/// - "Invalid password": heslo sa nezhoduje
 pub async fn login_user(username: &str, password: &str) -> Result<PublicUser, String> {
     let pool: PgPool = create_pool().await;
 
+    // Ziskanie pouzivatela z databazy
     let user = query!(
         "SELECT id, username, password_hash FROM users WHERE username = $1",
         username
@@ -201,8 +295,11 @@ pub async fn login_user(username: &str, password: &str) -> Result<PublicUser, St
     .await
     .map_err(|_| "User not found".to_string())?;
 
+    // Parsovanie hashu hesla z databazy
     let parsed_hash =
         PasswordHash::new(&user.password_hash).map_err(|_| "Invalid password hash".to_string())?;
+
+    // Overenie hesla pomocou Argon2
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .map_err(|_| "Invalid password".to_string())?;
@@ -213,19 +310,30 @@ pub async fn login_user(username: &str, password: &str) -> Result<PublicUser, St
     })
 }
 
+/// Ziska historiu vsetkych transakci pre dany ucet
+///
+/// # Parametre
+/// - account_id: UUID uctu
+///
+/// # Navratova hodnota
+/// Vracia zoznam vsetkych transakci (odoslanych aj prijatych) zoradeny podla casu
+///
+/// # Poznamka
+/// Transakcie su zoradene zostupne podla created_at (najnovsie prvy)
 pub async fn get_transaction_history(account_id: Uuid) -> Result<Vec<Transaction>, sqlx::Error> {
     let pool: PgPool = create_pool().await;
 
     let rows = query!(
         "SELECT id, from_account, to_account, amount, created_at 
          FROM transactions 
-         WHERE from_account = $1 OR to_account = $1  -- ← ВИПРАВЛЕНО!
+         WHERE from_account = $1 OR to_account = $1
          ORDER BY created_at DESC",
         account_id
     )
     .fetch_all(&pool)
     .await?;
 
+    // Konvertovanie riadkov z databazy na Transaction struktury
     let transactions = rows
         .into_iter()
         .map(|row| Transaction {
