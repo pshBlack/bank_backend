@@ -13,7 +13,6 @@ Minimalistický bankový REST API server napísaný v jazyku Rust s použitím f
 - [API Endpoints](#api-endpoints)
 - [Príklady použitia](#príklady-použitia)
 - [Štruktúra projektu](#štruktúra-projektu)
-- [Testovanie](#testovanie)
 
 ## ✨ Funkcie
 
